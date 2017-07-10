@@ -1,0 +1,12 @@
+# AWS CLI profiles to use - aws configure --profile dev
+:profiles: ['sandbox', 'dev', 'prod']
+# AWS Regions to scan
+:regions: ['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2', 'eu-central-1', 'eu-west-1', 'eu-west-2']
+# Tags to check for compliance (existence)
+:tags: ['Name', 'business_owner', 'cost_center', 'customer', 'product_name', 'provisioned_by']
+# Values to set for Tags by VPC to make them compliant
+:vpcs: {
+    Dev: {business_owner: 'mark.greene@example.com', cost_center: 'XYZ123', customer: 'Acme', product_name: 'Widget'}
+    Prod: {business_owner: 'mark.greene@example.com', cost_center: 'XYZ123', customer: 'Acme', product_name: 'Widget'}
+    Default: {business_owner: 'mark.greene@example.com', cost_center: 'XYZ123', customer: 'Acme', product_name: 'Widget'}
+}

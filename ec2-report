@@ -1,0 +1,109 @@
+#!/usr/bin/env ruby
+require 'aws-sdk'
+require 'yaml'
+
+require_relative 'string_color.rb'
+
+# Loops through aws accounts (credential profiles) in specified regions
+#   to output EC2 instance reports
+# Account profiles and regions are specified in `instance_count.yaml`
+# Assumes AWS CLI(SDK) credentials are configured with profiles (~/.aws/credentials)
+#   https://blogs.aws.amazon.com/security/post/Tx3D6U6WSFGOK2H/A-New-and-Standardized-Way-to-Manage-Credentials-in-the-AWS-SDKs
+
+ARGV.map!(&:downcase)
+@config_file = ARGV.last || 'report.yml'
+
+begin
+  puts "Amazon Instances Report on #{Time.now.strftime '%A %B %e, %Y at %H:%M:%S %Z'}"
+  puts
+  instance_report = []
+  total_instances = 0
+  total_running = 0
+  reservation_report = []
+
+  configuration = YAML.load(File.read(@config_file))
+  configuration[:profiles].each do |profile|
+    credentials = Aws::SharedCredentials.new(profile_name: profile)
+    iam = Aws::IAM::Client.new(credentials: credentials)
+    account_name = iam.list_account_aliases.account_aliases.first.upcase
+
+    puts "#{account_name}(#{profile})".bold
+    configuration[:regions].each do |region|
+      ec2 = Aws::EC2::Client.new(credentials: credentials, region: region)
+      region_name = Aws.partition('aws').region(region).description
+      reservations = ec2.describe_instances.reservations
+      count = reservations.reduce(0) {|count, reservation| count + reservation.instances.count}
+      total_instances += count
+
+      puts "  %s".green % region_name.bold
+      puts "    %-3s EC2 instances" % count
+      instance_report << reservations.reduce({}) do |report, reservation|
+        instance = reservation.instances.first
+        total_running += 1 if instance.state.name == 'running'
+        id = instance.instance_id
+        platform = instance.platform
+        type = instance.instance_type
+        type += "(#{platform})" if not platform.nil?
+        report[id] = {type: type}
+        report[id][:state] = instance.state.name
+        tags = instance.tags.reduce({}) {|tags, tag| tags[tag[:key]] = tag[:value]; tags}
+        report[id][:name] = tags['Name']
+        report[id][:vpc] = instance.vpc_id
+        report[id][:missing_tags] = configuration[:tags] - tags.keys
+        report
+      end.each do |id, info|
+        if not info[:missing_tags].empty?
+          puts "    %s is missing [#{info[:missing_tags].join(', ')}]".bold.red %
+                  "#{id}(#{info[:name]})".bold.italic
+        end
+      end
+
+      instance_report.last.reduce({}) do |totals, (id, info)|
+        totals[info[:type]] = 0 if not totals.key? info[:type]
+        totals[info[:type]] += 1 if info[:state] == 'running'
+        totals
+      end.sort.each {|type, count| puts "        %s \t#{type}".blue % "#{count}".bold }
+
+      reserved_instances = ec2.describe_reserved_instances.reserved_instances
+      puts "        -- \tReserved" if not reserved_instances.empty?
+      reservation_report << reserved_instances.reduce({}) do |types, instance|
+        platform = instance.product_description
+        type = instance.instance_type
+        type += "(#{platform})" if not platform.nil?
+        types[type] = 0 if not types.key? type
+        types[type] += instance.instance_count
+        types
+      end.sort.each {|type, count| puts "        %-3d\t#{type}" % count}
+    end
+    puts
+  end
+
+  puts "TOTALS (all accounts)".bold
+  puts "    %-3s EC2 instances (#{total_running} running)" % total_instances
+  instance_report.reduce({}) do |totals, region|
+    region.each do |id, info|
+      totals[info[:type]] = 0 if not totals.key? info[:type]
+      totals[info[:type]] += 1 if info[:state] == 'running'
+    end
+    totals
+  end.sort.each {|type, count| puts "        %s \t#{type}".blue % "#{count}".bold }
+
+  puts "        ---\tReserved"
+  reservation_report.reduce({}) do |totals, region|
+    region.each do |type, count|
+      totals[type] = 0 if not totals.key? type
+      totals[type] += count
+    end
+    totals
+  end.sort.each {|type, count| puts "        %s \t#{type}" % "#{count}".bold }
+
+  missing = instance_report.reduce(0) do |totals, region|
+    region.each {|id, info| totals += info[:missing_tags].empty? ? 0 : 1}
+    totals
+  end
+  puts "        ---\t---------------------"
+  puts "        %s \tare out of compliance".bold.blue % (missing > 0 ? "#{missing}".bold.red : "None")
+rescue Aws::EC2::Errors::ServiceError => msg
+  # rescues all errors returned by Amazon
+  puts "AWS Error: #{msg}".bold.red
+end

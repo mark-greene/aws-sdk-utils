@@ -1,0 +1,331 @@
+#!/usr/bin/env ruby
+require 'aws-sdk'
+require 'yaml'
+
+require_relative 'string_color.rb'
+
+VERSION = '0.1.2'
+
+class Instance < Aws::EC2::Types::Instance
+
+  attr_reader :name, :missing_tags
+
+  def initialize instance, required_tags
+    super(instance.to_h)
+    @missing_tags = required_tags - self.tags.reduce([]) {|tags, tag| tags << tag[:key]} if not self.tags.nil?
+    @missing_tags ||= []
+    @name = self.tags.detect{ |tag| tag[:key] == 'Name' } if not self.tags.nil?
+    @name = name[:value] if not @name.nil?
+    @name ||= 'Default'
+  end
+
+  def running?
+    self.state[:name] == 'running'
+  end
+
+  def stopped?
+    self.state[:name] == 'stopped'
+  end
+
+  def terminated?
+    self.state[:name] == 'terminated'
+  end
+
+  def compliant?
+    @missing_tags.empty?
+  end
+end
+
+def missing_tags tags, required_tags
+ tags = tags.reduce([]) {|tags, tag| tags << tag[:key]}
+ missing_tags = required_tags - tags if not tags.nil?
+ missing_tags ||= []
+end
+
+def rds_missing_tags rds, instance_arn, required_tags
+ tags = rds.list_tags_for_resource({resource_name: instance_arn}).tag_list
+ missing_tags tags, required_tags
+end
+
+def elb_missing_tags elb, load_balancer_name, required_tags
+ tags = elb.describe_tags({load_balancer_names: [load_balancer_name]}).tag_descriptions.first.tags
+ missing_tags tags, required_tags
+end
+
+def elbv2_missing_tags elb, load_balancer_arn, required_tags
+ tags = elb.describe_tags({resource_arns: [load_balancer_arn]}).tag_descriptions.first.tags
+ missing_tags tags, required_tags
+end
+
+
+def autoscaling_tag name, key, value, propagate = true
+  {
+    key: key,
+    value: value,
+    resource_id: name,  #ResourceId<~String> - The name of the Auto Scaling group.
+    propagate_at_launch: propagate, #PropagateAtLaunch<~Boolean> - Specifies whether the new tag will be applied to instances launched after the tag is created. The same behavior applies to updates: If you change a tag, the changed tag will be applied to all instances launched after you made the change.
+    resource_type: 'auto-scaling-group' #ResourceType<~String> - The kind of resource to which the tag is applied. Currently, Auto Scaling supports the auto-scaling-group resource type.
+  }
+end
+
+def autoscaling_tags name, tags
+  tags.map { |key, value|  autoscaling_tag name, key, value }
+end
+
+def tags_for_autoscaling ec2, vpc_id, vpc_name, vpcs_tags, name
+  vpc_name ||= vpc_name ec2.describe_vpcs.vpcs.detect {|vpc| vpc.vpc_id == vpc_id}, vpcs_tags
+  tags = vpcs_tags[vpc_name].reduce([]){ |tags, (k, v)| tags << [k.to_s, v.to_s] }
+  tags << ['script_info', "service-report v#{VERSION}"]
+  tags << ['provisioned_by', "devops"]
+  tags = autoscaling_tags name, tags
+  tags << autoscaling_tag(name, 'Name', name, false)
+  tags
+end
+
+def vpc_name vpc, vpcs_tags
+  name = vpc.tags.detect{ |tag| tag[:key] == 'Name' } if not vpc.nil?
+  name = name[:value] if not name.nil?
+  name ||= 'Default'
+  if not vpcs_tags[name]
+    puts "Warning: VPC '#{name}' tags not found, using 'Default'".bold.yellow
+    name = 'Default'
+  end
+  name
+end
+
+def vpc_info vpc, vpcs_tags
+  name = vpc_name vpc, vpcs_tags
+  [vpc, name]
+end
+
+def tags_for_vpc_by_name vpc_name, vpcs_tags
+  tags = vpcs_tags[vpc_name].reduce([]){ |tags, (k, v)| tags << {key: k.to_s, value: v.to_s} }
+  tags << {key: 'script_info', value: "service-report v#{VERSION}"}
+  tags << {key: 'provisioned_by', value: "devops"}
+  tags
+end
+
+def tags_for_vpc ec2, vpc_id, vpcs_tags
+  vpc_name = vpc_name ec2.describe_vpcs.vpcs.detect {|vpc| vpc.vpc_id == vpc_id}, vpcs_tags
+  tags_for_vpc_by_name vpc_name, vpcs_tags
+end
+
+
+ARGV.map!(&:downcase)
+@correct_compliance = ARGV.delete('fix') ? true : false
+@config_file = ARGV.last || 'report.yml'
+
+begin
+  puts "Amazon Services on #{Time.now.strftime '%A %B %e, %Y at %H:%M:%S %Z'}"
+  puts
+
+  total_vpc = 0
+  total_rds = 0
+  total_ec2 = 0
+  total_elb = 0
+  total_asg = 0
+  total_cf  = 0
+  total_out_of_compliance = 0
+  total_users = 0
+
+  configuration = YAML.load(File.read(@config_file))
+  configuration[:profiles].each do |profile, tags|
+    credentials = Aws::SharedCredentials.new(profile_name: profile)
+    iam = Aws::IAM::Client.new(credentials: credentials)
+    account_name = iam.list_account_aliases.account_aliases.first.upcase
+    account_users = iam.list_users.users
+    total_users += account_users.count
+    puts "#{account_name}(#{profile}) - #{account_users.count} Users".bold
+
+    configuration[:regions].each do |region|
+      region_name = Aws.partition('aws').region(region).description
+      ec2 = Aws::EC2::Client.new(credentials: credentials, region: region)
+
+      vpcs = ec2.describe_vpcs.vpcs.reduce([]) {|info, vpc| info << vpc_info(vpc, configuration[:vpcs])}
+      total_vpc += vpcs.count
+
+      puts "  %s".green % region_name.bold
+      puts "    %-4s VPCs" % vpcs.count
+      vpcs.each do |vpc, name|
+        puts "         %-40s".cyan % [name+'('+vpc.vpc_id+')']
+        missing_tags = missing_tags vpc.tags, configuration[:tags]
+        if not missing_tags.empty?
+          puts "             Missing Tags [%s]".red % missing_tags.join(', ')
+          total_out_of_compliance += 1
+          if @correct_compliance
+            tags = tags_for_vpc ec2, vpc.vpc_id, configuration[:vpcs]
+            tags << {key: 'Name', value: name}
+            Aws::EC2::Vpc.new(credentials: credentials, region: region, id: vpc.vpc_id).create_tags({tags: tags})
+            puts "             Now Compliant"
+          end
+        end
+      end
+
+      if region == 'us-east-1'
+        cloudfront = Aws::CloudFront::Client.new(credentials: credentials, region: region)
+        distributions = cloudfront.list_distributions.distribution_list.items
+        total_cf += distributions.count
+        puts "    %-4s CloudFront Distributions" % distributions.count
+        distributions.each do |distribution|
+          puts "         %-20s\t%s\t%s".blue % [distribution.id, distribution.status, distribution.aliases.items[0]]
+        end
+      end
+
+      rds = Aws::RDS::Client.new(credentials: credentials, region: region)
+      rds_instances = rds.describe_db_instances.db_instances
+      rds_reserved = rds.describe_reserved_db_instances.reserved_db_instances
+      total_rds += rds_instances.count
+
+      puts "    %-4s RDS instances" % rds_instances.count
+      rds_instances.each do |db|
+        puts "         %-40s\t%s".blue % [db.db_instance_identifier+'('+db.db_instance_class+')', db.engine]
+        missing_tags = rds_missing_tags rds, db.db_instance_arn, configuration[:tags]
+        if not missing_tags.empty?
+          puts "             Missing Tags [%s]".red % missing_tags.join(', ')
+          total_out_of_compliance += 1
+          if @correct_compliance
+            tags = tags_for_vpc ec2, db.db_subnet_group.vpc_id, configuration[:vpcs]
+            tags << {key: 'Name', value: db.db_instance_identifier}
+            rds.add_tags_to_resource({resource_name: db.db_instance_arn, tags: tags})
+            puts "             Now Compliant"
+          end
+        end
+      end
+      puts "         ---\tReserved" if not rds_reserved.empty?
+      rds_reserved.reduce({}) do |types, instance|
+        platform = instance.product_description
+        type = instance.db_instance_class
+        type += "(#{platform})" if not platform.nil?
+        types[type] = 0 if not types.key? type
+        types[type] += instance.db_instance_count
+        types
+      end.sort.each {|type, count| puts "         %-3d\t#{type}" % count}
+
+      elb = Aws::ElasticLoadBalancing::Client.new(credentials: credentials, region: region)
+      elbs = elb.describe_load_balancers.load_balancer_descriptions
+      total_elb += elbs.count
+
+      puts "    %-4s ELB Classic instances" % elbs.count
+      elbs.each do |lb|
+        puts "         %-40s\t%s".blue % [lb.load_balancer_name, lb.scheme]
+        missing_tags = elb_missing_tags elb, lb.load_balancer_name, configuration[:tags]
+        if not missing_tags.empty?
+          puts "             Missing Tags [%s]".red % missing_tags.join(', ')
+          total_out_of_compliance += 1
+          if @correct_compliance
+            tags = tags_for_vpc ec2, lb.vpc_id, configuration[:vpcs]
+            tags << {key: 'Name', value: lb.load_balancer_name}
+            elb.add_tags({load_balancer_names: [lb.load_balancer_name], tags: tags})
+            puts "             Now Compliant"
+          end
+        end
+      end
+
+      elb = Aws::ElasticLoadBalancingV2::Client.new(credentials: credentials, region: region)
+      elbs = elb.describe_load_balancers.load_balancers
+      total_elb += elbs.count
+
+      puts "    %-4s ELB Application instances" % elbs.count
+      elbs.each do |lb|
+        puts "         %-40s\t%s".blue % [lb.load_balancer_name, lb.scheme]
+        missing_tags = elbv2_missing_tags elb, lb.load_balancer_arn, configuration[:tags]
+        if not missing_tags.empty?
+          puts "             Missing Tags [%s]".red % missing_tags.join(', ')
+          total_out_of_compliance += 1
+          if @correct_compliance
+            tags = tags_for_vpc ec2, lb.vpc_id, configuration[:vpcs]
+            tags << {key: 'Name', value: lb.load_balancer_name}
+            elb.add_tags({resource_arns: [lb.load_balancer_arn], tags: tags})
+            puts "             Now Compliant"
+          end
+        end
+      end
+
+      as_client = Aws::AutoScaling::Client.new(credentials: credentials, region: region)
+      as_groups = as_client.describe_auto_scaling_groups.auto_scaling_groups
+      total_asg += as_groups.count
+
+      puts "    %-4s EC2 AutoScaling groups" % as_groups.count
+      as_groups.each do |group|
+        puts "         %-40s".blue % [group.auto_scaling_group_name]
+        missing_tags = missing_tags group.tags, configuration[:tags]
+        if not missing_tags.empty?
+          puts "             Missing Tags [%s]".red % missing_tags.join(', ')
+          total_out_of_compliance += 1
+          if @correct_compliance
+            subnet = ec2.describe_subnets.subnets.detect {|subnet| group.vpc_zone_identifier.include? subnet.subnet_id}
+            tags = tags_for_autoscaling ec2, subnet.vpc_id, nil, configuration[:vpcs], group.auto_scaling_group_name if not subnet.nil?
+            tags ||= tags_for_autoscaling ec2, nil, 'Default', configuration[:vpcs], group.auto_scaling_group_name
+            as_client.create_or_update_tags({tags: tags})
+            puts "             Now Compliant"
+          end
+        end
+      end
+
+      reservations = ec2.describe_instances.reservations
+      count = reservations.reduce(0) {|count, reservation| count + reservation.instances.count}
+      total_ec2 += count
+
+      puts "    %-4s EC2 instances" % count
+      reservations.reduce({}) do |types, reservation|
+        reservation.instances.each do |instance|
+          instance = Instance.new instance, configuration[:tags]
+          if not instance.terminated?
+            platform = instance.platform
+            type = instance.instance_type
+            type += "(#{platform})" if not platform.nil?
+            types[type] = 0 if not types.key? type
+            types[type] += 1
+          end
+        end
+        types
+      end.sort.each {|type, count| puts "         %-4d\t#{type}" % count}
+
+      ec2_reserved = ec2.describe_reserved_instances.reserved_instances
+      puts "         ---\tReserved" if not ec2_reserved.empty?
+      ec2_reserved.reduce({}) do |types, instance|
+        platform = instance.product_description
+        type = instance.instance_type
+        type += "(#{platform})" if not platform.nil?
+        types[type] = 0 if not types.key? type
+        types[type] += instance.instance_count
+        types
+      end.sort.each {|type, count| puts "         %-4d\t#{type}" % count}
+
+      reservations.each do |reservation|
+        reservation.instances.each do |instance|
+          instance = Instance.new instance, configuration[:tags]
+          if not instance.terminated? and not instance.compliant?
+            puts "%-s is missing tags [%s]".red %
+                  [instance.name+'('+instance.instance_id+')', instance.missing_tags.join(', ')]
+            total_out_of_compliance += 1
+            if @correct_compliance
+              tags = tags_for_vpc ec2, instance.vpc_id, configuration[:vpcs]
+              tags << {key: 'Name', value: instance.name}
+              ec2.create_tags({resources: [instance.instance_id], tags: tags})
+              puts "%-s is now compliant" % [instance.name+'('+instance.instance_id+')']
+            end
+          end
+        end
+      end
+
+      puts
+    end
+  end
+
+  puts "TOTALS (all accounts)".bold
+  puts "    %-4s VPCs" % total_vpc
+  puts "    %-4s CF distributions" % total_cf
+  puts "    %-4s EC2 instances" % total_ec2
+  puts "    %-4s EC2 AutoScaling groups" % total_asg
+  puts "    %-4s RDS instances" % total_rds
+  puts "    %-4s ELB instances" % total_elb
+  puts "    %-4s Users" % total_users
+  if total_out_of_compliance > 0 and not @correct_compliance
+    puts "    ----"
+    puts "    %-4s Resources out of compliance and not fixed".red % total_out_of_compliance
+  end
+rescue Aws::EC2::Errors::ServiceError => msg
+  # rescues all errors returned by Amazon
+  puts "AWS Error: #{msg}".bold.red
+end

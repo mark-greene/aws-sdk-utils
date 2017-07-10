@@ -1,0 +1,106 @@
+#!/usr/bin/env ruby
+require 'aws-sdk'
+require 'yaml'
+
+require_relative 'string_color.rb'
+
+
+def rds_missing_tags rds, instance_arn, required_tags
+ tags = rds.list_tags_for_resource({resource_name: instance_arn}).tag_list
+ tags = tags.reduce([]) {|tags, tag| tags << tag[:key]}
+ missing_tags = required_tags - tags if not tags.nil?
+ missing_tags ||= []
+end
+
+ARGV.map!(&:downcase)
+@config_file = ARGV.last || 'report.yml'
+
+begin
+  puts "Amazon RDS Report on #{Time.now.strftime '%A %B %e, %Y at %H:%M:%S %Z'}"
+  puts
+
+  instance_report = []
+  reservation_report = []
+  total_instances = 0
+
+  configuration = YAML.load(File.read(@config_file))
+  configuration[:profiles].each do |profile, tags|
+    credentials = Aws::SharedCredentials.new(profile_name: profile)
+    iam = Aws::IAM::Client.new(credentials: credentials)
+    account_name = iam.list_account_aliases.account_aliases.first.upcase
+    puts "#{account_name}(#{profile})".bold
+
+    configuration[:regions].each do |region|
+      region_name = Aws.partition('aws').region(region).description
+      rds = Aws::RDS::Client.new(credentials: credentials, region: region)
+      rds_instances = rds.describe_db_instances.db_instances
+      rds_reserved = rds.describe_reserved_db_instances.reserved_db_instances
+      total_instances += rds_instances.count
+
+      puts "  %s".green % region_name.bold
+      puts "    %-3s RDS instances" % rds_instances.count
+      instance_report << rds_instances.reduce({}) do |report, db|
+        id = db.db_instance_arn
+        platform = db.engine
+        type = db.db_instance_class
+        type += "(#{platform})" if not platform.nil?
+        report[id] = {type: type}
+        report[id][:id] = db.db_instance_identifier
+        report[id][:vpc] = db.db_subnet_group.vpc_id
+        report[id][:missing_tags] = rds_missing_tags(rds, id, configuration[:tags])
+        report
+      end.each do |id, info|
+        if not info[:missing_tags].empty?
+          puts "    %s is missing [#{info[:missing_tags].join(', ')}]".bold.red %
+                  "#{info[:id]}".bold.italic
+        end
+      end
+
+      instance_report.last.reduce({}) do |totals, (id, info)|
+        totals[info[:type]] = 0 if not totals.key? info[:type]
+        totals[info[:type]] += 1
+        totals
+      end.sort.each {|type, count| puts "        %-3s \t#{type}".blue % "#{count}".bold }
+
+      puts "        --\tReserved" if not rds_reserved.empty?
+      reservation_report << rds_reserved.reduce({}) do |types, instance|
+        platform = instance.product_description
+        type = instance.db_instance_class
+        type += "(#{platform})" if not platform.nil?
+        types[type] = 0 if not types.key? type
+        types[type] += instance.db_instance_count
+        types
+      end.sort.each {|type, count| puts "        %-3d\t#{type}" % count}
+    end
+    puts
+  end
+
+  puts "TOTALS (all accounts)".bold
+  puts "    %-3s RDS instances" % total_instances
+  instance_report.reduce({}) do |totals, region|
+    region.each do |id, info|
+      totals[info[:type]] = 0 if not totals.key? info[:type]
+      totals[info[:type]] += 1
+    end
+    totals
+  end.sort.each {|type, count| puts "        %-3s \t#{type}".blue % "#{count}".bold }
+
+  puts "        ---\tReserved"
+  reservation_report.reduce({}) do |totals, region|
+    region.each do |type, count|
+      totals[type] = 0 if not totals.key? type
+      totals[type] += count
+    end
+    totals
+  end.sort.each {|type, count| puts "        %-3s \t#{type}" % "#{count}".bold }
+
+  missing = instance_report.reduce(0) do |totals, region|
+    region.each {|id, info| totals += info[:missing_tags].empty? ? 0 : 1}
+    totals
+  end
+  puts "        ---\t---------------------"
+  puts "        %s \tare out of compliance".bold.blue % (missing > 0 ? "#{missing}".bold.red : "None")
+rescue Aws::EC2::Errors::ServiceError => msg
+  # rescues all errors returned by Amazon
+  puts "AWS Error: #{msg}".bold.red
+end
