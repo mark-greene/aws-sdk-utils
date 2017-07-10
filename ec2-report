@@ -6,7 +6,7 @@ require_relative 'string_color.rb'
 
 # Loops through aws accounts (credential profiles) in specified regions
 #   to output EC2 instance reports
-# Account profiles and regions are specified in `instance_count.yaml`
+# Account profiles and regions are specified in `report.yaml`
 # Assumes AWS CLI(SDK) credentials are configured with profiles (~/.aws/credentials)
 #   https://blogs.aws.amazon.com/security/post/Tx3D6U6WSFGOK2H/A-New-and-Standardized-Way-to-Manage-Credentials-in-the-AWS-SDKs
 
